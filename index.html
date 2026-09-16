@@ -321,6 +321,26 @@ tr:last-child td{border-bottom:none;}
    ÖĞRETMEN DEFTERİM — veri modeli, localStorage, render
    ========================================================= */
 const STORAGE_KEY = 'ogretmenDefteriDB_v1';
+const CDN = {
+  xlsx: 'https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js',
+  pdfjs: 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js',
+  pdfjsWorker: 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js',
+  tesseract: 'https://cdnjs.cloudflare.com/ajax/libs/tesseract.js/5.0.4/tesseract.min.js'
+};
+function loadScript(src){
+  return new Promise((resolve, reject)=>{
+    if(document.querySelector(`script[src="${src}"]`)){ resolve(); return; }
+    const s = document.createElement('script');
+    s.src = src; s.onload = ()=>resolve(); s.onerror = ()=>reject(new Error('Kütüphane yüklenemedi (internet bağlantını kontrol et): ' + src));
+    document.head.appendChild(s);
+  });
+}
+function normTr(s){
+  return String(s==null?'':s).toLowerCase()
+    .replaceAll('İ','i').replaceAll('I','i').replaceAll('ı','i')
+    .replaceAll('ş','s').replaceAll('ğ','g').replaceAll('ü','u').replaceAll('ö','o').replaceAll('ç','c')
+    .trim();
+}
 const COLORS = ['#E4B13F','#4C7A5B','#B5473A','#3E6657','#8B6BB5','#4C7CA8','#C9862B','#6B8E4E'];
 const DAYS = ['Pazartesi','Salı','Çarşamba','Perşembe','Cuma','Cumartesi','Pazar'];
 const DAY_BY_JS = ['Pazar','Pazartesi','Salı','Çarşamba','Perşembe','Cuma','Cumartesi'];
@@ -423,7 +443,100 @@ function gradeQueue(cls, onlyStudentId){
   return q;
 }
 
-/* ---------- MODAL ---------- */
+/* =========================================================
+   ÖĞRENCİ LİSTESİ İÇE AKTARMA (Excel / PDF / Fotoğraf)
+   ========================================================= */
+async function parseExcelFile(file){
+  const buf = await file.arrayBuffer();
+  const wb = XLSX.read(buf, {type:'array'});
+  const ws = wb.Sheets[wb.SheetNames[0]];
+  return XLSX.utils.sheet_to_json(ws, {header:1, defval:''});
+}
+function excelRowsToLines(rows){
+  let headerIdx = -1, noCol = -1, adCol = -1, soyadCol = -1, adSoyadCol = -1;
+  for(let i=0; i<Math.min(rows.length,10); i++){
+    const row = rows[i]; if(!row) continue;
+    let found = false;
+    row.forEach((cell,ci)=>{
+      const n = normTr(cell); if(!n) return;
+      if(n.includes('ogrenci') && n.includes('no')){ noCol=ci; found=true; }
+      else if(noCol===-1 && (n==='no' || n==='numara' || n==='okul no' || n==='s.no')){ noCol=ci; }
+      if(n.includes('ad') && n.includes('soyad')){ adSoyadCol=ci; found=true; }
+      else if(n==='ad' || n==='adi'){ adCol=ci; found=true; }
+      if(n.includes('soyad')){ soyadCol=ci; found=true; }
+    });
+    if(found){ headerIdx=i; break; }
+  }
+  const dataRows = headerIdx>=0 ? rows.slice(headerIdx+1) : rows;
+  const lines = [];
+  dataRows.forEach(row=>{
+    if(!row || row.every(c=>String(c).trim()==='')) return;
+    let name='', no='';
+    if(adSoyadCol>=0) name = String(row[adSoyadCol]||'').trim();
+    else if(adCol>=0 || soyadCol>=0) name = [row[adCol]||'', row[soyadCol]||''].map(x=>String(x).trim()).filter(Boolean).join(' ');
+    if(noCol>=0) no = String(row[noCol]||'').trim();
+    if(!name){
+      const textCells = row.filter(c=>c!=='' && isNaN(Number(c)));
+      name = textCells.join(' ').trim();
+      const numCells = row.filter(c=>c!=='' && !isNaN(Number(c)) && String(c).trim()!=='');
+      if(!no && numCells.length) no = String(numCells[numCells.length-1]).trim();
+    }
+    if(name) lines.push(no ? `${no} - ${name}` : name);
+  });
+  return lines;
+}
+async function parsePdfFile(file){
+  const buf = await file.arrayBuffer();
+  const pdf = await pdfjsLib.getDocument({data:buf}).promise;
+  const lines = [];
+  for(let p=1; p<=pdf.numPages; p++){
+    const page = await pdf.getPage(p);
+    const content = await page.getTextContent();
+    const rowsMap = {};
+    content.items.forEach(it=>{
+      const y = Math.round(it.transform[5]/3)*3;
+      if(!rowsMap[y]) rowsMap[y]=[];
+      rowsMap[y].push(it);
+    });
+    Object.keys(rowsMap).map(Number).sort((a,b)=>b-a).forEach(y=>{
+      const text = rowsMap[y].sort((a,b)=>a.transform[4]-b.transform[4]).map(it=>it.str).join(' ').replace(/\s+/g,' ').trim();
+      if(text) lines.push(text);
+    });
+  }
+  return lines;
+}
+async function parseImageFile(file, onProgress){
+  const result = await Tesseract.recognize(file, 'tur', { logger: onProgress });
+  return result.data.text.split('\n').map(l=>l.trim()).filter(Boolean);
+}
+function rawLineToEntry(line){
+  const nums = line.match(/\d+/g) || [];
+  const no = nums.length>=2 ? nums[1] : (nums.length===1 ? nums[0] : '');
+  const name = line.replace(/\d+/g,'').replace(/\b(erkek|kız|kiz|kadın|kadin|bay|bayan|e|k)\b/gi,'').replace(/\s+/g,' ').trim();
+  if(!name || name.length<2) return null;
+  return no ? `${no} - ${name}` : name;
+}
+function linesToEntries(lines){ return lines.map(rawLineToEntry).filter(Boolean); }
+
+function renderImportModal(cls){
+  return `
+    <h3>Öğrenci Listesi İçe Aktar</h3>
+    <p class="muted" style="font-size:13px;margin-top:-6px;">Excel (.xlsx/.csv), PDF veya fotoğraf yükle. Sistem isim/numaraları bulmaya çalışır — sonucu aşağıda kontrol edip düzelttikten sonra ekle. En güvenilir sonuç Excel ile alınır (e-okul'da "Excel'e Aktar" seçeneği varsa onu tercih et).</p>
+    <div class="formrow">
+      <label>Dosya seç</label>
+      <input type="file" id="importFileInput" data-action="importFileSelected" data-id="${cls.id}" accept=".xlsx,.xls,.csv,.pdf,image/*">
+    </div>
+    <div id="importStatus" class="muted" style="font-size:12.5px;min-height:18px;margin-bottom:8px;"></div>
+    <div class="formrow">
+      <label>Öğrenci listesi (her satırda bir öğrenci — "numara - ad soyad" ya da sadece ad soyad)</label>
+      <textarea id="importTextarea" rows="10" style="font-family:monospace;font-size:12.5px;" placeholder="Örn:&#10;3 - Ahmet Emir Korkmaz&#10;4 - Ahmet Gültekin&#10;..."></textarea>
+    </div>
+    <div class="modal-actions" style="justify-content:space-between;">
+      <button type="button" class="btn outline" data-action="closeModal">Vazgeç</button>
+      <button type="button" class="btn gold" data-action="commitImport" data-id="${cls.id}">İçe Aktar</button>
+    </div>
+  `;
+}
 function openModal(html){
   document.getElementById('modalBody').innerHTML = html;
   document.getElementById('overlay').classList.add('open');
@@ -660,6 +773,7 @@ function renderTabStudents(cls){
         <input class="searchbox" placeholder="Öğrenci ara..." value="${escapeHtml(state.search)}" data-action="searchStudents" />
         <div class="spacer"></div>
         <button class="btn outline sm" data-action="printStudentList" data-id="${cls.id}">🖨️ Listeyi Yazdır / PDF</button>
+        <button class="btn outline sm" data-action="openImport" data-id="${cls.id}">📥 Listeden İçe Aktar</button>
         <button class="btn gold sm" data-action="addStudent" data-id="${cls.id}">+ Öğrenci Ekle</button>
       </div>
       ${list.length===0? `<div class="empty"><div class="big">🧑‍🎓</div><h3>Henüz öğrenci yok</h3><p class="muted">Listeyi oluşturmak için "+ Öğrenci Ekle" butonunu kullan.</p></div>` :
@@ -1284,6 +1398,63 @@ function handleAction(ds, ev){
           <tr><td>${p}</td><td>${m}</td><td>${deskNo?`Masa ${deskNo}`:'—'}</td></tr>
         </table>`;
       openPrintView(`${escapeHtml(s.name)} — Karne / Özet`, `${escapeHtml(cls.name)} · ${fmtDate(todayISO())}`, body);
+      break;
+    }
+
+    case 'openImport': return openModal(renderImportModal(cls));
+    case 'importFileSelected': {
+      const input = document.getElementById('importFileInput');
+      const file = input && input.files[0];
+      if(!file) break;
+      const statusEl = document.getElementById('importStatus');
+      const taEl = document.getElementById('importTextarea');
+      const ext = file.name.split('.').pop().toLowerCase();
+      (async ()=>{
+        try{
+          let lines = [];
+          if(['xlsx','xls','csv'].includes(ext)){
+            statusEl.textContent = 'Excel okunuyor...';
+            await loadScript(CDN.xlsx);
+            const rows = await parseExcelFile(file);
+            lines = excelRowsToLines(rows);
+          } else if(ext==='pdf'){
+            statusEl.textContent = 'PDF okunuyor...';
+            await loadScript(CDN.pdfjs);
+            pdfjsLib.GlobalWorkerOptions.workerSrc = CDN.pdfjsWorker;
+            lines = linesToEntries(await parsePdfFile(file));
+          } else {
+            statusEl.textContent = 'Fotoğraf yükleniyor (Türkçe dil verisi ilk seferde biraz sürebilir)...';
+            await loadScript(CDN.tesseract);
+            const rawLines = await parseImageFile(file, (m)=>{
+              if(m.status==='recognizing text') statusEl.textContent = `Fotoğraf okunuyor... %${Math.round(m.progress*100)}`;
+            });
+            lines = linesToEntries(rawLines);
+          }
+          if(taEl) taEl.value = lines.join('\n');
+          statusEl.textContent = lines.length ? `${lines.length} satır bulundu — lütfen kontrol edip düzelt.` : 'Hiçbir şey bulunamadı, listeyi elle yapıştırabilirsin.';
+        }catch(err){
+          console.error(err);
+          statusEl.textContent = 'Okunamadı: ' + (err && err.message ? err.message : err);
+        }
+      })();
+      break;
+    }
+    case 'commitImport': {
+      const ta = document.getElementById('importTextarea');
+      const lines = ta ? ta.value.split('\n').map(l=>l.trim()).filter(Boolean) : [];
+      let added = 0;
+      lines.forEach(line=>{
+        const m = line.match(/^(\d+)\s*-\s*(.+)$/);
+        let no=null, name;
+        if(m){ no=Number(m[1]); name=m[2].trim(); } else { name=line.trim(); }
+        if(!name) return;
+        cls.students.push({id:uid(), name, number:no, grades:{sinav1:null,sinav2:null,sozlu1:null,sozlu2:null}});
+        added++;
+      });
+      if(added){ saveDB(); }
+      closeModal();
+      if(added) alert(`${added} öğrenci eklendi.`);
+      renderMain();
       break;
     }
 
